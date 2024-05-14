@@ -1,0 +1,157 @@
+// Define the study area boundary using your shapefile
+var studyArea = ee.FeatureCollection('projects/ee-evanomondi/assets/Study_area');
+
+// Load the pH and CaCO3 data from your CSV file
+var soilData = ee.FeatureCollection('projects/ee-evanomondi/assets/pH_CaCO3_data1')
+  .map(function(feature){
+    var properties = feature.toDictionary();
+    var x = ee.Number(properties.get('x'));
+    var y = ee.Number(properties.get('y'));
+    var pH = ee.Number(properties.get('pH'));
+    var CaCO3 = ee.Number(properties.get('CaCO3'));
+    return ee.Feature(ee.Geometry.Point([x, y]), {pH: pH, CaCO3: CaCO3});
+  });
+
+// Load the Sentinel-2, ALOS2 SAR, Digital Elevation Model, and climatic data for 2018
+var sentinel2 = ee.ImageCollection('COPERNICUS/S2')
+  .filterDate('2018-01-01', '2018-12-31')
+  .median();
+
+var alos2 = ee.Image('ALOS/ALOS2/PALSAR/YEARLY/FNF/2018');
+
+var dem = ee.Image('your_dem_image_id');
+
+var climaticData = ee.Image('your_climatic_data_id');
+
+// Prepare the training data by combining the soil data with the auxiliary variables
+var trainingData = soilData.map(function(feature){
+  var point = ee.Geometry(feature.geometry());
+  var pH = feature.get('pH');
+  var CaCO3 = feature.get('CaCO3');
+
+  var sentinel2Values = sentinel2.sampleRegions({
+    collection: ee.FeatureCollection(point),
+    scale: 10,
+    tileScale: 16
+  }).first();
+
+  var alos2Value = alos2.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: point,
+    scale: 10,
+    maxPixels: 1e9
+  }).get('fnf');
+
+  var demValue = dem.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: point,
+    scale: 10,
+    maxPixels: 1e9
+  }).get('elevation');
+
+  var climaticDataValue = climaticData.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: point,
+    scale: 10,
+    maxPixels: 1e9
+  }).get('your_climatic_data_band_name');
+
+  return ee.Feature(point, {
+    pH: pH,
+    CaCO3: CaCO3,
+    sentinel2: sentinel2Values,
+    alos2: alos2Value,
+    dem: demValue,
+    climaticData: climaticDataValue
+  });
+});
+
+// Split the training data into training and validation sets
+var split = 0.7; // Change this value to adjust the split ratio
+var randomSeed = 123; // Change this value to set a specific random seed for reproducibility
+var trainingSet = trainingData.randomColumn('random', randomSeed).filter(ee.Filter.lt('random', split));
+var validationSet = trainingData.randomColumn('random', randomSeed).filter(ee.Filter.gte('random', split));
+
+// Prepare the training features and target
+var features = ee.List(['sentinel2', 'alos2', 'dem', 'climaticData']);
+var target = 'pH'; // Change this to 'CaCO3' for modeling CaCO3
+
+var trainingFeatures = trainingSet
+  .map(function(feature) {
+    var values = ee.Image(feature.get('sentinel2')).sampleRegions({
+      collection: ee.FeatureCollection(feature.geometry()),
+      scale: 10,
+      tileScale: 16
+    });
+    return feature.set('sentinel2', values);
+  });
+
+var trainingFeaturesArray = trainingFeatures.aggregate_array(features.slice(0, features.size()));
+
+var trainingFeaturesArray = ee.Array(trainingFeaturesArray)
+  .toList()
+  .map(function(row) {
+    return ee.Feature(null, ee.Dictionary.fromLists(features, row));
+  });
+
+var trainingFeatures = ee.FeatureCollection(trainingFeaturesArray);
+var trainingTarget = trainingSet.select(target);
+
+// Prepare the validation features and target
+var validationFeaturesList = validationSet
+  .map(function(feature) {
+    var values = ee.Image(feature.get('sentinel2')).sampleRegions({
+      collection: ee.FeatureCollection(feature.geometry()),
+      scale: 10,
+      tileScale: 16
+    });
+    return feature.set('sentinel2', values);
+  });
+
+var validationFeaturesArray = validationFeaturesList.aggregate_array(features.slice(0, features.size()));
+
+var validationFeaturesArray = ee.Array(validationFeaturesArray)
+  .toList()
+  .map(function(row) {
+    return ee.Feature(null, ee.Dictionary.fromLists(features, row));
+  });
+
+var validationFeatures = ee.FeatureCollection(validationFeaturesArray);
+var validationTarget = validationSet.select(target);
+
+// Train the model using a Random Forest algorithm
+var nTrees = 100; // Change this value to adjust the number of trees in the model
+// Train the model using a Random Forest algorithm
+var nTrees = 100; // Change this value to adjust the number of trees in the model
+var rf = ee.Classifier.smileRandomForest({
+  numberOfTrees: nTrees,
+  variablesPerSplit: 0,
+  bagFraction: 0.5,
+  seed: randomSeed
+}).train({
+  features: trainingFeatures,
+  classProperty: target,
+  inputProperties: features
+});
+
+// Make predictions on the validation set
+var validationPredictions = validationFeatures.map(function(feature) {
+  var prediction = rf.predict(feature);
+  var predictionImage = ee.Image.constant(prediction).rename('prediction');
+  return feature.addBands(predictionImage);
+});
+
+// Visualize the validation set and the predictions
+var pHmin = 5.5; // Change this value to adjust the pH range for visualization
+var pHmax = 8.5; // Change this value to adjust the pH range for visualization
+var visParams = {
+  bands: ['B4', 'B3', 'B2'],
+  min: 0,
+  max: 2000
+};
+
+Map.centerObject(studyArea, 12);
+Map.addLayer(sentinel2.clip(studyArea), visParams, 'Sentinel-2');
+Map.addLayer(alos2.clip(studyArea), {}, 'ALOS2 SAR');
+Map.addLayer(validationSet.filter(ee.Filter.gt(target, pHmin)).filter(ee.Filter.lt(target, pHmax)).geometry(), {color: 'red'}, target + ' validation set');
+Map.addLayer(validationPredictions.filter(ee.Filter.gt('prediction', pHmin)).filter(ee.Filter.lt('prediction', pHmax)).geometry(), {color: 'green'}, target + ' validation predictions');
